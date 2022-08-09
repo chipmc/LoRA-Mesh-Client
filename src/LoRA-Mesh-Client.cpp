@@ -7,14 +7,14 @@
 
 // Version list 
 // v1 - initial attempt - no sleep
+// v2 - Rough working example - one node
 
 // Included libraries
 #include <RHMesh.h>
 #include <RH_RF95.h>
 
 // Particle Product definitions
-const uint8_t firmVersion = 1;
-const time_t sendFrequency = 30;					// Time between sends in seconds
+const uint8_t firmVersion = 2;
 
 // Mesh has much greater memory requirements, and you may need to limit the
 // max message length to prevent wierd crashes
@@ -72,16 +72,21 @@ uint16_t hourly = 0;
 uint16_t daily = 0;
 const uint16_t devID = 65534;
 uint8_t alerts = 0;
+uint16_t nextReportSeconds = 60;					// Default send every 1 minute until configured by the gateway
+time_t lastReportSeconds = 0;						// Ensures we send right away
 
 void setup() 
 {
+	// Wait for a USB serial connection for up to 15 seconds
+	waitFor(Serial.isConnected, 15000);
+
 	pinMode(blueLED,OUTPUT);						// Blue led signals sends
 	pinMode(intPin, INPUT_PULLDOWN);				// Initialize sensor interrupt pin
 
 	// Take note if we are restarting due to a pin reset - either by the user or the watchdog - could be sign of trouble
   	if (System.resetReason() == RESET_REASON_PIN_RESET || System.resetReason() == RESET_REASON_USER) { // Check to see if we are starting from a pin reset or a reset in the sketch
     	resetCount++;
-    	if (resetCount > 6) alerts = 13;                 // Excessive resets
+    	if (resetCount > 6) alerts = 13;            // Excessive resets
   	}
 
 	if (!manager.init()) Log.info("init failed"); // Defaults after init are 434.0MHz, 0.05MHz AFC pull-in, modulation FSK_Rb2_4Fd36
@@ -93,9 +98,13 @@ void setup()
 	// you can set transmitter powers from 5 to 23 dBm:
 	driver.setTxPower(23, false);
 
-	attachInterrupt(intPin, sensorISR, RISING);                        // Pressure Sensor interrupt from low to high
+	attachInterrupt(intPin, sensorISR, RISING);     // Pressure Sensor interrupt from low to high
 
-	Log.info("Startup complete - battery %4.2f", System.batteryCharge());
+	Log.info("Startup complete - battery %4.2f%%, reporting every %u seconds clock is %s", System.batteryCharge(), nextReportSeconds, (Time.isValid()) ? "valid" : "not valid");
+
+	Time.zone(-5.0);								// Local time in East Coast
+	Time.setDSTOffset(1.0);							// DST offset of 1
+	Time.beginDST();								// Summer - so daylight savings
 
 	if (state == INITIALIZATION_STATE) state = IDLE_STATE;	// We got through setup without error
 }
@@ -106,10 +115,8 @@ void loop()
 
 	switch (state) {
 		case IDLE_STATE: {							// State we spend time in when there is nothing else to do
-			static time_t lastTransmit = 0;
-			if (millis() - lastTransmit > sendFrequency * 1000L) {	// Using the sendFrequency set above, we go to the reporing state
+			if (Time.now() - lastReportSeconds > nextReportSeconds) {	// Using the sendFrequency set above, we go to the reporing state
 				sensorDetect = true;
-				lastTransmit = millis();
 				state = REPORTING_STATE;
 			}
 		}
@@ -149,7 +156,7 @@ void sendMessage() {
 	uint8_t battState = System.batteryState();
     int16_t rssi = driver.lastRssi();
 	static uint8_t msgCnt = 0;
-	uint8_t payload[22];
+	uint8_t payload[17];
 
 	payload[0] = 0; 								// to be replaced/updated
 	payload[1] = 0; 								// to be replaced/updated
@@ -178,11 +185,18 @@ void sendMessage() {
 		// Now wait for a reply from the ultimate server
 		uint8_t len = sizeof(buf);
 		uint8_t from;     
+		Log.info("Message sent");
 		if (manager.recvfromAckTimeout(buf, &len, 3000, &from)) {
 			buf[len] = 0;
 			char data[64];
 			snprintf(data, sizeof(data),"Response: 0x%02x rssi=%d - delivery %s", from, driver.lastRssi(), (buf[0] == payload[16]) ? "successful":"unsuccessful");
 			Log.info(data);
+			uint32_t newTime = ((buf[1] << 24) | (buf[2] << 16) | (buf[3] << 8) | buf[4]);
+			Log.info("Time is: %lu",newTime);
+			Time.setTime(newTime);  // Set time based on response from gateway
+			Log.info("Time set to %lu local time is %s", newTime, Time.timeStr(newTime).c_str());
+			Log.info("Next report in %u seconds",((buf[5] << 8) | buf[6]));
+			nextReportSeconds = ((buf[5] << 8) | buf[6]);
 			if (Particle.connected()) Particle.publish("Update",data,PRIVATE);
  		}
 		else {
@@ -190,7 +204,7 @@ void sendMessage() {
 		}
 	}
 	else Log.info("sendtoWait failed. Are the intermediate mesh servers running?");
-
+	lastReportSeconds = Time.now();
 	digitalWrite(blueLED,LOW);
 }
 
